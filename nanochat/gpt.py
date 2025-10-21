@@ -63,38 +63,98 @@ class CausalSelfAttention(nn.Module):
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
 
-    def forward(self, x, cos_sin, kv_cache):
+    def forward(self, x, xa, cos_sin, cache=None, env_id=None, token_sequence=None):
+        """
+        Forward pass supporting both self-attention and cross-attention.
+
+        Args:
+            x: input tensor (queries come from here)
+            xa: optional encoder memory for cross-attention.
+                If None, this is self-attention (K,V from x).
+                If provided, this is cross-attention (K,V from xa).
+            cos_sin: rotary embedding frequencies
+            cache: dictionary cache indexed by env_id or (env_id, *token_sequence)
+            env_id: environment identifier for cache lookup
+            token_sequence: tuple of tokens generated so far (for decoder self-attention)
+        """
         B, T, C = x.size()
 
-        # Project the input to get queries, keys, and values
+        # Query always comes from x
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
-        k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
-        v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
 
-        # Apply Rotary Embeddings to queries and keys to get relative positional encoding
-        cos, sin = cos_sin
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin) # QK rotary embedding
-        q, k = norm(q), norm(k) # QK norm
-        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2) # make head be batch dim, i.e. (B, T, H, D) -> (B, H, T, D)
+        # Key and Value handling: different for self-attention vs cross-attention
+        if xa is not None:
+            # Cross-attention: K,V from encoder output
+            # Cache key is just env_id
+            if cache is not None and env_id is not None and env_id in cache:
+                # Already cached from first decoder pass, just retrieve it
+                k, v = cache[env_id]
+                # Apply norm to query only
+                q = norm(q)
+                q = q.transpose(1, 2)  # (B, H, T, D)
+            else:
+                # First pass: compute K,V from encoder output and cache them
+                Tkv = xa.size(1)
+                k = self.c_k(xa).view(B, Tkv, self.n_kv_head, self.head_dim)
+                v = self.c_v(xa).view(B, Tkv, self.n_kv_head, self.head_dim)
+                q, k = norm(q), norm(k)  # QK norm
+                q = q.transpose(1, 2)
+                k = k.transpose(1, 2)
+                v = v.transpose(1, 2)
+                # Store in cache for reuse
+                if cache is not None and env_id is not None:
+                    cache[env_id] = (k, v)
+        else:
+            # Self-attention: K,V from x
+            kv_source = x
+            Tkv = kv_source.size(1)
+            k = self.c_k(kv_source).view(B, Tkv, self.n_kv_head, self.head_dim)
+            v = self.c_v(kv_source).view(B, Tkv, self.n_kv_head, self.head_dim)
 
-        # Apply KV cache: insert current k,v into cache, get the full view so far
-        if kv_cache is not None:
-            k, v = kv_cache.insert_kv(self.layer_idx, k, v)
-        Tq = q.size(2) # number of queries in this forward pass
-        Tk = k.size(2) # number of keys/values in total (in the cache + current forward pass)
+            # Apply Rotary Embeddings
+            cos, sin = cos_sin
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = norm(q), norm(k)  # QK norm
+            q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+            # Insert into cache and get full view
+            if cache is not None and env_id is not None and token_sequence is not None:
+                # Cache key is (env_id, *token_sequence)
+                cache_key = (env_id, *token_sequence)
+                if cache_key not in cache:
+                    # Create new KVCache for this sequence
+                    from .engine import KVCache
+                    # TODO: Get these dimensions from config
+                    max_len = 1024  # Placeholder
+                    num_layers = 12  # Placeholder - need to get from model config
+                    kv_cache_tensor = torch.zeros(
+                        num_layers, 2, B, self.n_kv_head, max_len, self.head_dim,
+                        dtype=torch.float32, device=k.device
+                    )
+                    cache[cache_key] = KVCache(kv_cache=kv_cache_tensor, pos=0)
+                kv_cache_inst = cache[cache_key]
+                k, v = kv_cache_inst.insert_kv(self.layer_idx, k, v)
+
+
+        Tq = q.size(2)  # number of queries in this forward pass
+        Tk = k.size(2)  # number of keys/values in total
 
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
         enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
-        if kv_cache is None or Tq == Tk:
+        # Attention: different logic for self-attention vs cross-attention
+        if xa is not None:
+            # Cross-attention: no causal masking
+            y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
+        elif cache is None or Tq == Tk:
             # During training (no KV cache), attend as usual with causal attention
             # And even if there is KV cache, we can still use this simple version when Tq == Tk
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=enable_gqa)
         elif Tq == 1:
-            # During inference but with a single query in this forward pass:
+            # Self-attention during inference with a single query:
             # The query has to attend to all the keys/values in the cache
             y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
         else:
-            # During inference AND we have a chunk of queries in this forward pass:
+            # Self-attention during inference with multiple queries:
             # First, each query attends to all the cached keys/values (i.e. full prefix)
             attn_mask = torch.zeros((Tq, Tk), dtype=torch.bool, device=q.device) # True = keep, False = mask
             prefix_len = Tk - Tq
@@ -124,13 +184,43 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config, layer_idx, cross_attention=False):
+        """
+        Transformer block supporting both encoder and decoder layers.
+
+        Args:
+            config: model configuration
+            layer_idx: layer index for self-attention KV cache
+            cross_attention: if True, this is a decoder layer with cross-attention.
+                           if False, this is an encoder layer (self-attention only).
+        """
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
+        # Cross-attention: ALL decoder layers use the same cache index (config.n_layer)
+        # since they all attend to the same encoder output
+        self.cross_attn = (
+            CausalSelfAttention(config, config.n_layer) if cross_attention else None
+        )
         self.mlp = MLP(config)
 
-    def forward(self, x, cos_sin, kv_cache):
-        x = x + self.attn(norm(x), cos_sin, kv_cache)
+    def forward(self, x, xa, cos_sin, cache=None, env_id=None, token_sequence=None):
+        """
+        Forward pass.
+
+        Args:
+            x: input tensor
+            xa: optional encoder output for cross-attention (decoder only)
+            cos_sin: rotary embedding frequencies
+            cache: dictionary cache for KV storage
+            env_id: environment identifier
+            token_sequence: tuple of tokens generated so far
+        """
+        # Self-attention (xa=None for this call)
+        x = x + self.attn(norm(x), None, cos_sin, cache, env_id, token_sequence)
+        # Cross-attention if this is a decoder layer
+        if self.cross_attn:
+            x = x + self.cross_attn(norm(x), xa, cos_sin, cache, env_id, None)
+        # MLP
         x = x + self.mlp(norm(x))
         return x
 
@@ -164,7 +254,8 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight)
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
-        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        device = self.transformer.wte.weight.device
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim, device=device)
         self.cos, self.sin = cos, sin
         # Cast the embeddings from fp32 to bf16: optim can tolerate it and it saves memory: both in the model and the activations
         if self.transformer.wte.weight.device.type == "cuda":
@@ -183,10 +274,8 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=1.0)
 
     # TODO: bump base theta more, e.g. 100K is more common more recently
-    def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        # autodetect the device from model embeddings
-        if device is None:
-            device = self.transformer.wte.weight.device
+    @staticmethod
+    def _precompute_rotary_embeddings(seq_len, head_dim, base=10000, device='cpu', dtype=torch.bfloat16):
         # stride the channels
         channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
         inv_freq = 1.0 / (base ** (channel_range / head_dim))
@@ -195,7 +284,7 @@ class GPT(nn.Module):
         # calculate the rotation frequencies at each (time, channel) pair
         freqs = torch.outer(t, inv_freq)
         cos, sin = freqs.cos(), freqs.sin()
-        cos, sin = cos.bfloat16(), sin.bfloat16() # keep them in bfloat16
+        cos, sin = cos.to(dtype), sin.to(dtype)
         cos, sin = cos[None, :, None, :], sin[None, :, None, :] # add batch and head dims for later broadcasting
         return cos, sin
 
