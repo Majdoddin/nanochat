@@ -84,11 +84,12 @@ class CausalSelfAttention(nn.Module):
 
         # Key and Value handling: different for self-attention vs cross-attention
         if xa is not None:
-            # Cross-attention: K,V from encoder output
-            # Cache key is just env_id
-            if cache is not None and env_id is not None and env_id in cache:
+            # Cross-attention: K,V from encoder output (each layer has different k,v!)
+            # Cache key includes layer_idx since each layer has its own c_k, c_v weights
+            cache_key = (env_id, 'cross', self.layer_idx)
+            if cache is not None and env_id is not None and cache_key in cache:
                 # Already cached from first decoder pass, just retrieve it
-                k, v = cache[env_id]
+                k, v = cache[cache_key]
                 # Apply norm to query only
                 q = norm(q)
                 q = q.transpose(1, 2)  # (B, H, T, D)
@@ -103,7 +104,7 @@ class CausalSelfAttention(nn.Module):
                 v = v.transpose(1, 2)
                 # Store in cache for reuse
                 if cache is not None and env_id is not None:
-                    cache[env_id] = (k, v)
+                    cache[cache_key] = (k, v)
         else:
             # Self-attention: K,V from x
             kv_source = x
@@ -111,9 +112,10 @@ class CausalSelfAttention(nn.Module):
             k = self.c_k(kv_source).view(B, Tkv, self.n_kv_head, self.head_dim)
             v = self.c_v(kv_source).view(B, Tkv, self.n_kv_head, self.head_dim)
 
-            # Apply Rotary Embeddings
-            cos, sin = cos_sin
-            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            # Apply Rotary Embeddings (if provided)
+            if cos_sin is not None:
+                cos, sin = cos_sin
+                q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
             q, k = norm(q), norm(k)  # QK norm
             q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
 
@@ -127,11 +129,7 @@ class CausalSelfAttention(nn.Module):
                     # TODO: Get these dimensions from config
                     max_len = 1024  # Placeholder
                     num_layers = 12  # Placeholder - need to get from model config
-                    kv_cache_tensor = torch.zeros(
-                        num_layers, 2, B, self.n_kv_head, max_len, self.head_dim,
-                        dtype=torch.float32, device=k.device
-                    )
-                    cache[cache_key] = KVCache(kv_cache=kv_cache_tensor, pos=0)
+                    cache[cache_key] = KVCache(B, self.n_kv_head, max_len, self.head_dim, num_layers)
                 kv_cache_inst = cache[cache_key]
                 k, v = kv_cache_inst.insert_kv(self.layer_idx, k, v)
 
@@ -142,6 +140,7 @@ class CausalSelfAttention(nn.Module):
         # Attention: queries attend to keys/values autoregressively. A few cases to handle:
         enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
         # Attention: different logic for self-attention vs cross-attention
+        enable_gqa = self.n_head != self.n_kv_head # Group Query Attention (GQA): duplicate key/value heads to match query heads if desired
         if xa is not None:
             # Cross-attention: no causal masking
             y = F.scaled_dot_product_attention(q, k, v, is_causal=False, enable_gqa=enable_gqa)
@@ -196,10 +195,9 @@ class Block(nn.Module):
         """
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        # Cross-attention: ALL decoder layers use the same cache index (config.n_layer)
-        # since they all attend to the same encoder output
+        # Cross-attention: use same layer_idx (cache key includes 'cross' to distinguish)
         self.cross_attn = (
-            CausalSelfAttention(config, config.n_layer) if cross_attention else None
+            CausalSelfAttention(config, layer_idx) if cross_attention else None
         )
         self.mlp = MLP(config)
 
